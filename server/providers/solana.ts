@@ -19,6 +19,8 @@ const HELIUS_MAINNET_GENESIS = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
 const WRAPPED_SOL_MINT = "So11111111111111111111111111111111111111112";
 const GECKO_BASE = "https://api.geckoterminal.com/api/v2";
 const DEX_BASE = "https://api.dexscreener.com";
+const HELIUS_MAINNET_HTTP_BASE = "https://mainnet.helius-rpc.com/";
+const HELIUS_MAINNET_WS_BASE = "wss://mainnet.helius-rpc.com/";
 const BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 const BASE58_INDEX = new Map([...BASE58_ALPHABET].map((character, index) => [character, BigInt(index)]));
 
@@ -39,6 +41,18 @@ function getHeliusKey() {
   const key = process.env.HELIUS_API_KEY;
   if (!key) throw new ProviderError("Helius mainnet access is not configured.", "HELIUS_API_KEY");
   return key;
+}
+
+function heliusUrl(base: string) {
+  return `${base}?api-key=${encodeURIComponent(getHeliusKey())}`;
+}
+
+export function heliusMainnetHttpUrl() {
+  return heliusUrl(HELIUS_MAINNET_HTTP_BASE);
+}
+
+export function heliusMainnetWebSocketUrl() {
+  return heliusUrl(HELIUS_MAINNET_WS_BASE);
 }
 
 export class ProviderError extends Error {
@@ -142,7 +156,7 @@ async function fetchJson<T>(url: string, provider: string, init?: RequestInit): 
 export function rpc<T>(method: string, params: unknown[], ttlMs = 0) {
   const cacheKey = `helius:${method}:${createHash("sha256").update(JSON.stringify(params)).digest("hex")}`;
   const load = async () => {
-    const url = `https://mainnet.helius-rpc.com/?api-key=${encodeURIComponent(getHeliusKey())}`;
+    const url = heliusMainnetHttpUrl();
     const result = await fetchJson<{ result?: T; error?: { message?: string } }>(url, "Helius Solana mainnet RPC", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -378,7 +392,7 @@ export async function lookupToken(mint: string) {
   const solPricePairsPromise = mint === WRAPPED_SOL_MINT ? Promise.resolve(null) : cached(`dex:pairs:${WRAPPED_SOL_MINT}`, 30_000, () => fetchJson<DexPair[] | null>(`${DEX_BASE}/token-pairs/v1/solana/${WRAPPED_SOL_MINT}`, "DEX Screener wrapped-SOL reference"));
   const [assetResult, pairResult, supplyResult, mintAccountResult, solPriceResult, mainnetResult] = await Promise.allSettled([
     cached(`helius:asset:${mint}`, 60_000, async () => {
-      const url = `https://mainnet.helius-rpc.com/?api-key=${encodeURIComponent(getHeliusKey())}`;
+      const url = heliusMainnetHttpUrl();
       const body = await fetchJson<{ result?: unknown; error?: { message?: string } }>(url, "Helius DAS", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: "cotra-asset", method: "getAsset", params: { id: mint, options: { showFungible: true } } }) });
       if (body.error) throw new ProviderError(body.error.message ?? "Helius DAS returned an error", "Helius DAS");
       return body.result ?? null;

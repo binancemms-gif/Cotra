@@ -1,12 +1,13 @@
 import { trpc } from "@/lib/trpc";
 import {
   Activity, ArrowDownRight, ArrowUpRight, Bell, Check, ChevronDown, CircleHelp,
-  Copy, ExternalLink, Eye, Gauge, Menu, RefreshCw, Search, ShieldAlert, Wallet,
+  Copy, ExternalLink, Eye, Gauge, Menu, Radio, RefreshCw, Search, ShieldAlert, Wallet,
   Waves, X,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { Link, useLocation } from "wouter";
 import type { MarketSnapshot, TokenMarket } from "../../../server/providers/solana";
+import type { PumpStreamStatus, PumpTradeEvent } from "../../../server/providers/pump-stream";
 
 type SavedWallet = { address: string; label: string };
 const WATCH_KEY = "cotra-followed-wallets";
@@ -129,6 +130,103 @@ function PoolList({ pools, loading, stale }: { pools: MarketSnapshot["pools"]; l
   return <section className="panel pool-panel"><div className="panel-heading"><div><div className="eyebrow">ON-CHAIN VENUES</div><h2>Solana pools</h2></div><span className="source-mini"><SourceStatus status={stale ? "stale" : loading ? "stale" : pools.length ? "live" : "unavailable"} /> {stale ? "STALE" : "GECKOTERMINAL"}</span></div>{loading ? <div className="small-empty">Loading pool observations…</div> : !pools.length ? <div className="small-empty">Pool data unavailable. No liquidity estimates are fabricated.</div> : <div className="pool-list">{pools.slice(0, 6).map((pool, index) => <div className="pool-row" key={`${pool.address}-${index}`}><div className="pool-icon"><Waves size={15} /></div><div className="pool-info"><strong>{pool.name}</strong><span>{pool.venue} · {pool.address ? shorten(pool.address, 4, 4) : "pool address unavailable"}</span></div><div className="pool-stat"><strong>{money(pool.liquidityUsd, 0)}</strong><span>pool liquidity · source-reported</span></div><div className="pool-stat pool-volume"><strong>{money(pool.volume24hUsd, 0)}</strong><span>volume · 24h</span></div></div>)}</div>}<div className="panel-footnote">Pool observations are individual pools—not lending TVL, and not added into an aggregate.</div></section>;
 }
 
+function LivePumpStreamPanel() {
+  const [status, setStatus] = useState<PumpStreamStatus | null>(null);
+  const [events, setEvents] = useState<PumpTradeEvent[]>([]);
+  const [browserState, setBrowserState] = useState<"connecting" | "open" | "reconnecting">("connecting");
+  const [controlPending, setControlPending] = useState(false);
+  const [controlError, setControlError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const source = new EventSource("/api/stream/pump");
+    let pendingTrades: PumpTradeEvent[] = [];
+    let flushTimer: ReturnType<typeof setTimeout> | null = null;
+    const flushTrades = () => {
+      flushTimer = null;
+      const batch = pendingTrades.splice(0).reverse();
+      if (!batch.length) return;
+      setEvents(current => {
+        const ids = new Set<string>();
+        return [...batch, ...current].filter(trade => {
+          if (ids.has(trade.id)) return false;
+          ids.add(trade.id);
+          return true;
+        }).slice(0, 30);
+      });
+    };
+    source.onopen = () => setBrowserState("open");
+    source.onerror = () => setBrowserState("reconnecting");
+    source.addEventListener("snapshot", message => {
+      try {
+        const payload = JSON.parse((message as MessageEvent<string>).data) as { status?: PumpStreamStatus; trades?: PumpTradeEvent[] };
+        if (payload.status) setStatus(payload.status);
+        if (Array.isArray(payload.trades)) setEvents(payload.trades.slice(0, 30));
+      } catch { /* The UI remains in its current state on a malformed stream frame. */ }
+    });
+    source.addEventListener("status", message => {
+      try {
+        const next = JSON.parse((message as MessageEvent<string>).data) as PumpStreamStatus;
+        setStatus(next);
+      } catch { /* Do not present malformed provider status as live. */ }
+    });
+    source.addEventListener("trade", message => {
+      try {
+        const trade = JSON.parse((message as MessageEvent<string>).data) as PumpTradeEvent;
+        if (typeof trade.id !== "string" || typeof trade.signature !== "string") return;
+        pendingTrades.push(trade);
+        if (pendingTrades.length > 250) pendingTrades.shift();
+        if (!flushTimer) flushTimer = setTimeout(flushTrades, 250);
+      } catch { /* Do not render malformed/unverified stream messages. */ }
+    });
+    return () => {
+      source.close();
+      if (flushTimer) clearTimeout(flushTimer);
+    };
+  }, []);
+
+  const toggleStream = async () => {
+    const action = status?.enabled ? "stop" : "start";
+    setControlPending(true);
+    setControlError(null);
+    try {
+      const response = await fetch(`/api/stream/pump/${action}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      const payload = await response.json() as { status?: PumpStreamStatus; error?: string };
+      if (!response.ok) throw new Error(payload.error || `Stream control failed (${response.status}).`);
+      if (payload.status) setStatus(payload.status);
+    } catch (error) {
+      setControlError(error instanceof Error ? error.message : "Stream control failed.");
+    } finally {
+      setControlPending(false);
+    }
+  };
+
+  const live = status?.connectionState === "live" && status.mainnetVerified && browserState === "open";
+  const sourceState = live ? "live" : status?.connectionState === "reconnecting" || browserState === "reconnecting" ? "stale" : "unavailable";
+  const stateLabel = !status?.enabled ? "PAUSED · OFF BY DEFAULT" : live ? "CONFIRMED MAINNET STREAM" : sourceState === "stale" ? "RECONNECTING · PRIOR EVENTS RETAINED" : status?.connectionState === "subscribing" ? "WAITING FOR SUBSCRIPTIONS" : "MAINNET STREAM CONNECTING";
+
+  return <section className="panel live-trades-panel" aria-label="Live Pump.fun and PumpSwap trade instructions">
+    <div className="panel-heading live-trades-heading">
+      <div><div className="eyebrow">REAL-TIME · SOLANA MAINNET-BETA</div><h2>Live Pump.fun / PumpSwap instructions <span className="table-count">{events.length} recent</span></h2></div>
+      <div className="live-stream-actions"><span className={`live-stream-state stream-state-${sourceState}`}><SourceStatus status={sourceState} />{stateLabel}</span><button className={`stream-toggle ${status?.enabled ? "stream-toggle-stop" : ""}`} onClick={() => void toggleStream()} disabled={controlPending || browserState !== "open"}>{controlPending ? "Working…" : status?.enabled ? "Stop stream" : "Start mainnet stream"}</button></div>
+    </div>
+    <div className="stream-explainer"><Radio size={15} /><span>Helius confirmed logs · {status?.programs.filter(program => program.subscription === "live").length ?? 0}/2 subscriptions · {status?.logsReceived.toLocaleString() ?? "—"} program log notifications received</span></div>
+    <div className="stream-cost-note"><CircleHelp size={15} /><span>Helius usage: 1 credit per new WebSocket connection plus 2 credits per 0.1 MB of uncompressed streamed data. These program-wide filters can be high-volume. Cotra opens the shared upstream only after you press Start; confirm actual usage in your Helius dashboard. <a href="https://www.helius.dev/docs/billing/credits" target="_blank" rel="noreferrer">Current Helius credit schedule</a>.</span></div>
+    {controlError && <div className="stream-warning"><ShieldAlert size={14} /><span>{controlError}</span></div>}
+    {status?.lastError && sourceState !== "live" && <div className="stream-warning"><ShieldAlert size={14} /><span>{status.lastError}</span></div>}
+    {!events.length ? <div className="stream-empty"><Radio size={17} /><div><strong>{live ? "Listening for the next successful Buy/Sell instruction" : "Waiting for a verified mainnet subscription"}</strong><span>Non-trade program messages are withheld. No sample events are inserted.</span></div></div> : <div className="live-trade-list">{events.slice(0, 8).map(event => <div className="live-trade-row" key={event.id}>
+      <span className={`trade-side trade-side-${event.side.toLowerCase()}`}>{event.side}</span>
+      <div className="live-trade-program"><strong>{event.program}</strong><span>{event.instructions.join(" · ")}</span></div>
+      <div className="live-trade-slot"><strong>Slot {event.slot.toLocaleString()}</strong><span>{event.commitment} · observed {new Date(event.observedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</span></div>
+      <a href={`https://solscan.io/tx/${encodeURIComponent(event.signature)}`} target="_blank" rel="noreferrer" className="live-trade-signature" aria-label="Open confirmed transaction in Solscan"><span>{shorten(event.signature, 9, 8)}</span><ExternalLink size={13} /></a>
+    </div>)}</div>}
+    <div className="panel-footnote">Log-only feed: log notifications do not include mint, trader, fill amount or price. Disconnects may miss events; this in-memory view is not durable history and does not submit trades.{status?.lastMessageAt ? ` Last upstream log message observed ${new Date(status.lastMessageAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}.` : ""}</div>
+  </section>;
+}
+
 function WalletWatch({ wallets, onAdd, onRemove }: { wallets: SavedWallet[]; onAdd: (wallet: SavedWallet) => void; onRemove: (address: string) => void }) {
   const [address, setAddress] = useState("");
   const [message, setMessage] = useState("");
@@ -182,6 +280,7 @@ export default function Home() {
           <MetricCard title="Copy execution" value="Locked" detail="No signing provider authorized" icon={ShieldAlert} tone="amber" />
         </div>
         <section className="panel market-panel"><div className="panel-heading market-heading"><div><div className="eyebrow">SOLANA · SOURCE-ATTRIBUTED MARKET OBSERVATIONS</div><h2>Token pairs <span className="table-count">{data ? `${tokens.length} ${snapshot.error ? "last response" : "current"}` : "—"}</span></h2></div><div className="market-tools"><span className="feed-updated"><SourceStatus status={snapshot.error ? "stale" : data?.sources.some(source => source.status === "live" && source.source.startsWith("DEX Screener")) ? "live" : "unavailable"} /> Provider source <strong>DEX Screener</strong></span><button className="table-filter" onClick={() => setSearch("")}><span>Solana</span><ChevronDown size={14} /></button></div></div><TokenTable tokens={tokens} loading={snapshot.isLoading} error={Boolean(snapshot.error && !data)} /><div className="table-footer"><span>Price, volume, liquidity and 24h changes are provider-reported. Null fields are not estimated.</span><span>{snapshot.error ? "STALE · last fetch" : "DEX Screener · fetched"} {data?.sources.find(source => source.source === "DEX Screener Solana pairs")?.updatedAt ? new Date(data.sources.find(source => source.source === "DEX Screener Solana pairs")!.updatedAt!).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "—"}</span></div></section>
+        <LivePumpStreamPanel />
         <div className="lower-grid"><NewPoolsPanel pools={data?.newPools ?? []} loading={snapshot.isLoading} stale={Boolean(snapshot.error)} /><WalletWatch wallets={wallets} onAdd={wallet => setWallets(current => [...current, wallet])} onRemove={address => setWallets(current => current.filter(wallet => wallet.address !== address))} /></div>
         <PoolList pools={data?.pools ?? []} loading={snapshot.isLoading} stale={Boolean(snapshot.error)} />
         <div className="lower-grid lower-secondary"><SourcePanel sources={data?.sources ?? [{ source: "Solana data providers", status: "unavailable" as const, updatedAt: null, cacheTtlSeconds: 0, detail: "Waiting for the first provider response." }]} warnings={data?.warnings ?? ["Market data has not yet been received from any configured provider."]} /><section className="panel risk-panel"><div className="panel-heading"><div><div className="eyebrow">EVIDENCE OVER ASSUMPTIONS</div><h2>Methodology notes</h2></div><ShieldAlert size={17} className="risk-title-icon" /></div><div className="risk-note"><span className="risk-note-mark">01</span><p><strong>No composite liquidity total.</strong> Pair liquidity is shown per provider-returned pool. Overlapping venue totals are not summed.</p></div><div className="risk-note"><span className="risk-note-mark">02</span><p><strong>No guessed wallet identity.</strong> Tracked addresses are treated independently unless on-chain evidence supports a stated relationship.</p></div><div className="risk-note"><span className="risk-note-mark">03</span><p><strong>No trade safety guarantee.</strong> A missing check is unknown, not a pass. Copy trading stays locked pending secured authorization.</p></div><Link href="/token/So11111111111111111111111111111111111111112" className="risk-link">View wrapped SOL market data <ExternalLink size={13} /></Link></section></div>
