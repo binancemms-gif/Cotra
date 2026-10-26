@@ -1,0 +1,1 @@
+{"routes":[{"path":"/","title":"Cotra — Solana market observatory"},{"path":"/token/:mint","title":"Token intelligence"},{"path":"/wallet/:address","title":"Wallet activity"}]}
